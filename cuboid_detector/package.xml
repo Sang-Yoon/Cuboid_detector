@@ -4,7 +4,7 @@
   <name>cuboid_detector</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="Sang-YoonKim@gitlab.com">ksy</maintainer>
+  <maintainer email="sangyoon@g.skku.edu">ksy</maintainer>
   <license>TODO: License declaration</license>
 
   <test_depend>ament_copyright</test_depend>

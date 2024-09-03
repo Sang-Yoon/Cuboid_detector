@@ -15,13 +15,13 @@ class imgSaver(Node):
 
         self.bridge = CvBridge()
         self.depth_img_sub = self.create_subscription(
-            Image, "/depth_to_rgb/image_raw", self.depth_img_callback, 10
+            Image, "/L515/depth/image_rect_raw", self.depth_img_callback, 10
         )
         self.rgb_img_sub = self.create_subscription(
-            Image, "/rgb/image_raw", self.rgb_img_callback, 10
+            Image, "/L515/color/image_raw", self.rgb_img_callback, 10
         )
         self.camera_info_sub = self.create_subscription(
-            CameraInfo, "/rgb/camera_info", self.camera_info_callback, 10
+            CameraInfo, "/L515/color/camera_info", self.camera_info_callback, 10
         )
         self.img_save_dir = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "dataset", "data"
@@ -55,9 +55,14 @@ class imgSaver(Node):
         self.save_camera_info(msg)
 
     def save_img(self, msg, prefix, count):
-        cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
-        cv2.imwrite(os.path.join(self.img_save_dir, f"{prefix}_{count:06d}.png"), cv_img)
-        self.get_logger().info(f"Saved img: {prefix}_{count}.png")
+        if prefix == "depth":
+            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+            cv2.imwrite(os.path.join(self.img_save_dir, f"{prefix}_{count:06d}.png"), cv_img)
+            self.get_logger().info(f"Saved img: {prefix}_{count}.png")
+        elif prefix == "color":
+            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            cv2.imwrite(os.path.join(self.img_save_dir, f"{prefix}_{count:06d}.png"), cv_img)
+            self.get_logger().info(f"Saved img: {prefix}_{count}.png")
 
     def save_camera_info(self, msg):
         camera_info_filename = "camera_info.yaml"

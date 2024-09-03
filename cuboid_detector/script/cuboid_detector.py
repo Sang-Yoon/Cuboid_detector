@@ -1,243 +1,491 @@
 import os
+import yaml
+import json
 import cv2
 import numpy as np
-import yaml
 import open3d as o3d
-from sklearn.cluster import KMeans
+from yaml import Loader
+from tqdm import tqdm
+from scipy.spatial.transform import Rotation as R
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo
-import cv2
 from cv_bridge import CvBridge
+from ament_index_python.packages import (
+    get_package_share_directory,
+    PackageNotFoundError,
+)
+from collections import deque
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import Point, Quaternion, PoseWithCovariance
+from vision_msgs.msg import Detection3D, Detection3DArray, ObjectHypothesisWithPose
+from realsense2_camera_msgs.msg import Extrinsics
+
+
+def get_package_path(package_name):
+    try:
+        package_path = get_package_share_directory(package_name)
+        return package_path
+    except PackageNotFoundError:
+        print(f"Package '{package_name}' not found.")
+        return None
+
+
+def get_dirpath_iteratively(dirpath, num_iter):
+    for _ in range(num_iter):
+        dirpath = os.path.dirname(dirpath)
+    return dirpath
 
 
 class CuboidDetector(Node):
     def __init__(self):
         super().__init__("cuboid_detector")
         self.bridge = CvBridge()
+
+        self.color_img_sub = self.create_subscription(
+            Image, "/L515/color/image_raw", self.color_img_callback, 10
+        )
         self.depth_img_sub = self.create_subscription(
-            Image, "/depth_to_rgb/image_raw", self.depth_img_callback, 10
+            Image, "/L515/depth/image_rect_raw", self.depth_img_callback, 10
         )
-        self.rgb_img_sub = self.create_subscription(
-            Image, "/rgb/image_raw", self.rgb_img_callback, 10
+        self.color_camera_info_sub = self.create_subscription(
+            CameraInfo, "/L515/color/camera_info", self.camera_info_callback, 10
         )
-        self.camera_info_sub = self.create_subscription(
-            CameraInfo, "/rgb/camera_info", self.camera_info_callback, 10
+        self.depth_camera_info_sub = self.create_subscription(
+            CameraInfo, "/L515/depth/camera_info", self.camera_info_callback, 10
         )
+        self.depth_to_color_extrinsics_sub = self.create_subscription(
+            Extrinsics,
+            "/L515/extrinsics/depth_to_color",
+            self.depth_to_color_extrinsics_callback,
+            10,
+        )
+        self.detection_pub = self.create_publisher(
+            Detection3DArray, "/cuboid_detections", 10
+        )
+
         self.img_save_dir = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "dataset", "data"
         )
         self.cam_info_save_dir = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "dataset", "camera_info"
         )
+        self.pkg_name = "cuboid_detector"
+        self.pkg_path = get_dirpath_iteratively(get_package_path(self.pkg_name), 4)
+        self.mesh_path = os.path.join(
+            self.pkg_path,
+            "src/Cuboid_detector",
+            self.pkg_name,
+            "dataset/mesh/danpla_box.obj",
+        )
+        self.mesh = self.load_mesh(self.mesh_path)
 
-        self.mesh = self.load_mesh(mesh_file)
-        self.keypoints, self.descriptors = self.extract_keypoints_and_descriptors(
-            rgb_image
-        )
-        self.mesh_keypoints, self.mesh_descriptors = (
-            self.extract_keypoints_and_descriptors_from_mesh(self.mesh)
-        )
+        self.color_image_buffer = deque()
+        self.depth_image_buffer = deque()
+
+        self.color_intrinsic_matrix = None
+        self.depth_intrinsic_matrix = None
+        self.depth_to_color_extrinsics = None
+
+        self.detection_in_progress = False
+
+    def color_img_callback(self, msg):
+        if self.detection_in_progress:
+            return
+        color_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        color_timestamp = msg.header.stamp
+        self.color_image_buffer.append((color_timestamp, color_img))
+
+        self.match_and_process_images()
 
     def depth_img_callback(self, msg):
-        self.depth_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+        if self.detection_in_progress:
+            return
+        depth_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+        depth_timestamp = msg.header.stamp
+        self.depth_image_buffer.append((depth_timestamp, depth_img))
 
-    def rgb_img_callback(self, msg):
-        self.color_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+        self.match_and_process_images()
 
     def camera_info_callback(self, msg):
-        def convert_array(array):
-            if isinstance(array, np.ndarray):
-                return array.tolist()
-            return array
+        intrinsic_matrix = np.array(msg.k).reshape(3, 3)
 
-        camera_info_dict = {
-            "width": msg.width,
-            "height": msg.height,
-            "distortion_model": msg.distortion_model,
-            "D": convert_array(msg.d),
-            "K": convert_array(msg.k),
-            "R": convert_array(msg.r),
-            "P": convert_array(msg.p),
-        }
-        self.intrinsic_matrix = np.array(camera_info_dict["K"]).reshape(3, 3)
+        if msg.header.frame_id == "L515_color_optical_frame":
+            self.color_intrinsic_matrix = intrinsic_matrix
+        elif msg.header.frame_id == "L515_depth_optical_frame":
+            self.depth_intrinsic_matrix = intrinsic_matrix
+
+    def depth_to_color_extrinsics_callback(self, msg):
+        rotation = np.array(msg.rotation).reshape(3, 3)
+        translation = np.array(msg.translation)
+        extrinsics = np.eye(4)
+        extrinsics[:3, :3] = rotation
+        extrinsics[:3, 3] = translation
+        self.depth_to_color_extrinsics = extrinsics
+
+    def match_and_process_images(self):
+        while self.color_image_buffer and self.depth_image_buffer:
+            color_timestamp, color_img = self.color_image_buffer[0]
+            depth_timestamp, depth_img = self.depth_image_buffer[0]
+
+            time_diff = self.calculate_time_difference(color_timestamp, depth_timestamp)
+
+            if abs(time_diff) < self.time_tolerance():
+                self.color_image_buffer.popleft()
+                self.depth_image_buffer.popleft()
+                self.color_img = color_img
+                self.depth_img = depth_img
+                self.color_img_timestamp = color_timestamp
+                self.depth_img_timestamp = depth_timestamp
+                self.perform_detection()
+            elif time_diff < 0:
+                self.color_image_buffer.popleft()
+            else:
+                self.depth_image_buffer.popleft()
+
+    def calculate_time_difference(self, color_timestamp, depth_timestamp):
+        color_time_in_ns = color_timestamp.sec * 1e9 + color_timestamp.nanosec
+        depth_time_in_ns = depth_timestamp.sec * 1e9 + depth_timestamp.nanosec
+        return color_time_in_ns - depth_time_in_ns
+
+    def time_tolerance(self):
+        # Set a tolerance for time difference in nanoseconds (e.g., 50 milliseconds)
+        return 50 * 1e6
+
+    def align_color_depth(self):
+        depth_height, depth_width = self.depth_img.shape
+        color_height, color_width, _ = self.color_img.shape
+        aligned_depth_img = np.zeros((color_height, color_width), dtype=np.uint16)
+
+        R = self.depth_to_color_extrinsics[:3, :3]
+        t = self.depth_to_color_extrinsics[:3, 3]
+
+        for v in range(depth_height):
+            for u in range(depth_width):
+                depth_value = self.depth_img[v, u]
+                if depth_value == 0:
+                    continue
+
+                z = depth_value / 1000.0
+                x = (
+                    (u - self.depth_intrinsic_matrix[0, 2])
+                    * z
+                    / self.depth_intrinsic_matrix[0, 0]
+                )
+                y = (
+                    (v - self.depth_intrinsic_matrix[1, 2])
+                    * z
+                    / self.depth_intrinsic_matrix[1, 1]
+                )
+
+                point_3d = np.array([x, y, z])
+                point_3d_color = R @ point_3d + t
+
+                x_c = point_3d_color[0] / point_3d_color[2]
+                y_c = point_3d_color[1] / point_3d_color[2]
+
+                u_c = int(
+                    self.color_intrinsic_matrix[0, 0] * x_c
+                    + self.color_intrinsic_matrix[0, 2]
+                )
+                v_c = int(
+                    self.color_intrinsic_matrix[1, 1] * y_c
+                    + self.color_intrinsic_matrix[1, 2]
+                    + 60
+                )
+
+                if 0 <= u_c < color_width and 0 <= v_c < color_height:
+                    aligned_depth_img[v_c, u_c] = depth_value
+
+        mask = (aligned_depth_img == 0).astype(np.uint8)
+        aligned_depth_img = cv2.inpaint(
+            aligned_depth_img.astype(np.uint16),
+            mask,
+            inpaintRadius=3,
+            flags=cv2.INPAINT_TELEA,
+        )
+
+        return aligned_depth_img
 
     def load_mesh(self, mesh_file):
         mesh = o3d.io.read_triangle_mesh(mesh_file)
         mesh.compute_vertex_normals()
         return mesh
 
-    def detect_cuboid_2d(self):
-        pass
+    def check_and_process_images(self):
+        if (
+            self.color_img is not None
+            and self.depth_img is not None
+            and self.color_intrinsic_matrix is not None
+            and self.depth_intrinsic_matrix is not None
+            and self.depth_to_color_extrinsics is not None
+            and self.color_img_timestamp == self.depth_img_timestamp
+        ):
+            self.get_logger().info("Performing detection...")
+            self.perform_detection()
+        elif self.color_img_timestamp != self.depth_img_timestamp:
+            self.get_logger().info("Color and depth images are not synchronized.")
+            self.get_logger().info(f"Color timestamp: {self.color_img_timestamp}")
+            self.get_logger().info(f"Depth timestamp: {self.depth_img_timestamp}")
+        elif self.color_img is None:
+            self.get_logger().info("Color image is not received.")
+        elif self.depth_img is None:
+            self.get_logger().info("Depth image is not received.")
+        elif self.color_intrinsic_matrix is None:
+            self.get_logger().info("Color intrinsic matrix is not received.")
+        elif self.depth_intrinsic_matrix is None:
+            self.get_logger().info("Depth intrinsic matrix is not received.")
+        elif self.depth_to_color_extrinsics is None:
+            self.get_logger().info("Depth to color extrinsics is not received.")
 
-    def get_edges(self, rgb_img):
-        img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(img, 100, 200)
-        return edges
+    def perform_detection(self):
+        rgb_img = self.color_img
 
-    def get_corners(self, edges):
-        corners = cv2.goodFeaturesToTrack(edges, 4, 0.01, 10)
-        return corners
+        blue_regions = self.extract_blue_regions(rgb_img)
+        blue_regions = cv2.erode(blue_regions, np.ones((5, 5), np.uint8), iterations=1)
+        # cv2.imshow("blue_regions", blue_regions)
 
-    def visualize_features(self, rgb_img, edges, corners):
+        small_bbox, large_bbox = self.get_bbox(
+            blue_regions, rgb_img.shape[0], rgb_img.shape[1]
+        )
+        rgb_img_large_bbox = np.zeros_like(rgb_img)
+        large_x, large_y, large_w, large_h = large_bbox
+        rgb_img_large_bbox[large_y : large_y + large_h, large_x : large_x + large_w] = (
+            rgb_img[large_y : large_y + large_h, large_x : large_x + large_w]
+        )
+        # cv2.imshow("rgb_img_large_bbox", rgb_img_large_bbox)
+
+        small_x, small_y, small_w, small_h = small_bbox
+        black_regions = np.zeros_like(blue_regions)
+        black_regions[small_y : small_y + small_h, small_x : small_x + small_w] = (
+            self.extract_black_regions(rgb_img)[
+                small_y : small_y + small_h, small_x : small_x + small_w
+            ]
+        )
+        black_regions = cv2.erode(
+            black_regions, np.ones((5, 5), np.uint8), iterations=1
+        )
+
+        contours, _ = cv2.findContours(
+            black_regions, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+        )
+        contour = max(contours, key=cv2.contourArea)
+        epsilon = 0.1 * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        cv2.drawContours(rgb_img_large_bbox, [approx], 0, (0, 255, 0), 2)
+        # cv2.imshow("rgb_img_large_bbox_contour", rgb_img_large_bbox)
+
+        if len(approx) != 4:
+            return
+        corners = approx.reshape(4, 2)
         for corner in corners:
-            x, y = corner.ravel()
-            cv2.circle(rgb_img, (x, y), 3, 255, -1)
-        return rgb_img
+            cv2.circle(rgb_img_large_bbox, tuple(corner), 5, (0, 0, 255), -1)
+        # cv2.imshow("rgb_img_large_bbox_corners", rgb_img_large_bbox)
+
+        box_points = np.asarray(self.mesh.vertices)
+        box_x_min, box_x_max = np.min(box_points[:, 0]), np.max(box_points[:, 0])
+        box_y_min, box_y_max = np.min(box_points[:, 1]), np.max(box_points[:, 1])
+        box_z_min, box_z_max = np.min(box_points[:, 2]), np.max(box_points[:, 2])
+        box_top_corners = np.array(
+            [
+                [box_x_max, box_y_min, box_z_max],
+                [box_x_min, box_y_min, box_z_max],
+                [box_x_min, box_y_max, box_z_max],
+                [box_x_max, box_y_max, box_z_max],
+            ]
+        )
+
+        object_points = box_top_corners.astype(np.float32)
+        image_points = np.array(corners, dtype=np.float32)
+
+        def sort_points_ccw(points):
+            center = np.mean(points, axis=0)
+            return sorted(
+                points, key=lambda x: np.arctan2(x[1] - center[1], x[0] - center[0])
+            )
+
+        image_points = sort_points_ccw(image_points)
+
+        image_points = np.expand_dims(image_points, axis=1)
+        dist_coeffs = np.zeros((4, 1))
+
+        success, rotation_vector, translation_vector = cv2.solvePnP(
+            object_points, image_points, self.color_intrinsic_matrix, dist_coeffs
+        )
+
+        mesh_points_3d = self.mesh.sample_points_poisson_disk(number_of_points=10000)
+        mesh_points_2d, _ = cv2.projectPoints(
+            np.array(mesh_points_3d.points),
+            rotation_vector,
+            translation_vector,
+            self.color_intrinsic_matrix,
+            dist_coeffs,
+        )
+        mesh_points_2d = np.int32(mesh_points_2d).reshape(-1, 2)
+        shapes = np.zeros_like(rgb_img, np.uint8)
+        for i in range(len(mesh_points_2d)):
+            cv2.circle(shapes, tuple(mesh_points_2d[i]), 1, (0, 0, 255), -1)
+        out = rgb_img.copy()
+        alpha = 0.1
+        mask = shapes.astype(bool)
+        out[mask] = cv2.addWeighted(rgb_img, alpha, shapes, 1 - alpha, 0)[mask]
+        out = cv2.resize(out, (1280, 720))
+        cv2.imshow("result", out)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+        detection_array_msg = Detection3DArray()
+        detection_array_msg.header.stamp = self.get_clock().now().to_msg()
+        detection_array_msg.header.frame_id = "L515_color_optical_frame"
+        detection_msg = Detection3D()
+        hypothesis_with_pose = ObjectHypothesisWithPose()
+        hypothesis_with_pose.hypothesis.class_id = "1"
+        pose_with_covariance = PoseWithCovariance()
+        pose_with_covariance.pose.position = Point(
+            x=float(translation_vector[0]),
+            y=float(translation_vector[1]),
+            z=float(translation_vector[2]),
+        )
+        quat = R.from_rotvec(rotation_vector.flatten()).as_quat()
+        pose_with_covariance.pose.orientation = Quaternion(
+            x=float(quat[0]), y=float(quat[1]), z=float(quat[2]), w=float(quat[3])
+        )
+        hypothesis_with_pose.pose = pose_with_covariance
+        detection_msg.results.append(hypothesis_with_pose)
+        detection_array_msg.detections.append(detection_msg)
+        self.detection_pub.publish(detection_array_msg)
+        return detection_array_msg
+
+    def extract_blue_regions(self, rgb_img):
+        hsv_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2HSV)
+        lower_blue = np.array([90, 50, 50])
+        upper_blue = np.array([130, 255, 255])
+        blue_mask = cv2.inRange(hsv_img, lower_blue, upper_blue)
+        return blue_mask
+
+    def extract_black_regions(self, rgb_img):
+        hsv_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2HSV)
+        lower_black = np.array([0, 0, 0])
+        upper_black = np.array([180, 255, 80])
+        black_mask = cv2.inRange(hsv_img, lower_black, upper_black)
+        return black_mask
+
+    def get_bbox(self, mask, height, width):
+        x, y, w, h = cv2.boundingRect(mask)
+        center_x, center_y = x + w // 2, y + h // 2
+        small_w = int(w * 1.15)
+        small_h = int(h * 1.15)
+        small_x, small_y = center_x - small_w // 2, center_y - small_h // 2
+        large_w = int(w * 1.20)
+        large_h = int(h * 1.20)
+        large_x, large_y = center_x - large_w // 2, center_y - large_h // 2
+        if small_x < 0:
+            small_x = 0
+        if small_y < 0:
+            small_y = 0
+        if small_x + small_w > width:
+            small_w = width - small_x
+        if small_y + small_h > height:
+            small_h = height - small_y
+        if large_x < 0:
+            large_x = 0
+        if large_y < 0:
+            large_y = 0
+        if large_x + large_w > width:
+            large_w = width - large_x
+        if large_y + large_h > height:
+            large_h = height - large_y
+        return [small_x, small_y, small_w, small_h], [
+            large_x,
+            large_y,
+            large_w,
+            large_h,
+        ]
 
 
-def extract_blue_regions(img):
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+def evaluate_detection():
+    rclpy.init(args=None)
+    cuboid_detector = CuboidDetector()
 
-    lower_blue = np.array([100, 150, 0])
-    upper_blue = np.array([140, 255, 255])
+    dataset_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dataset")
+    img_path = os.path.join(dataset_path, "data")
 
-    mask = cv2.inRange(hsv, lower_blue, upper_blue)
-    return mask
+    intrinsic_path = os.path.join(dataset_path, "camera_info", "camera_info.yaml")
 
+    with open(intrinsic_path, "r") as f:
+        # Use the custom loader to handle special types
+        camera_info = yaml.load(f, Loader=Loader)
 
-def get_bbox(mask):
-    x, y, w, h = cv2.boundingRect(mask)
-    center_x, center_y = x + w // 2, y + h // 2
-    small_w = int(w * 1.15)
-    small_h = int(h * 1.15)
-    small_x, small_y = center_x - small_w // 2, center_y - small_h // 2
-    large_w = int(w * 1.2)
-    large_h = int(h * 1.2)
-    large_x, large_y = center_x - large_w // 2, center_y - large_h // 2
-    return [small_x, small_y, small_w, small_h], [large_x, large_y, large_w, large_h]
+    color_intrinsic_matrix = np.array(camera_info["K"]).reshape(3, 3)
 
+    color_img_list = [img for img in os.listdir(img_path) if "color" in img]
+    color_img_list.sort()
 
-def find_intersections(lines):
-    intersections = []
-    if lines is not None:
-        for i in range(len(lines)):
-            for j in range(i + 1, len(lines)):
-                x1, y1, x2, y2 = lines[i][0]
-                x3, y3, x4, y4 = lines[j][0]
+    target_color_img_list = [img for i, img in enumerate(color_img_list) if i % 20 == 0]
 
-                # 두 직선의 교차점 계산
-                A1 = y2 - y1
-                B1 = x1 - x2
-                C1 = A1 * x1 + B1 * y1
+    pred_pose_list = []
+    gt_pose_list = []
 
-                A2 = y4 - y3
-                B2 = x3 - x4
-                C2 = A2 * x3 + B2 * y3
+    with open(os.path.join(dataset_path, "data", "pose.json"), "r") as f:
+        gt_pose = np.array(json.load(f))
+    gt_pose_list.append(gt_pose)
 
-                determinant = A1 * B2 - A2 * B1
+    for i, img_name in enumerate(tqdm(target_color_img_list[:-4])):
+        img = cv2.imread(os.path.join(img_path, img_name))
+        cuboid_detector.color_img = img
+        cuboid_detector.color_intrinsic_matrix = color_intrinsic_matrix
+        detection_array_msg = cuboid_detector.perform_detection()
+        if detection_array_msg is not None:
+            pose_data = detection_array_msg.detections[0].results[0].pose.pose
+            pose = np.eye(4)
+            pose[:3, 3] = [
+                pose_data.position.x,
+                pose_data.position.y,
+                pose_data.position.z,
+            ]
+            pose[:3, :3] = R.from_quat(
+                [
+                    pose_data.orientation.x,
+                    pose_data.orientation.y,
+                    pose_data.orientation.z,
+                    pose_data.orientation.w,
+                ]
+            ).as_matrix()
+            pred_pose_list.append(pose)
+        else:
+            print(f"No pose detected for {img_name}")
 
-                if determinant != 0:
-                    x = (B2 * C1 - B1 * C2) / determinant
-                    y = (A1 * C2 - A2 * C1) / determinant
-                    intersections.append((int(x), int(y)))
-    return intersections
+    pred_pose_list = np.array(pred_pose_list)
+    gt_pose_list = np.array(gt_pose_list)[0]
 
+    translation_errors = []
+    rotation_errors = []
 
-def test():
-    print("Test")
-    img_save_dir = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)), "dataset", "data"
-    )
-    cam_info_save_dir = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)), "dataset", "camera_info"
-    )
+    for pred_pose, gt_pose in zip(pred_pose_list, gt_pose_list):
+        translation_error = np.linalg.norm(pred_pose[:3, 3] - gt_pose[:3, 3])
+        rotation_error = np.arccos(
+            (np.trace(pred_pose[:3, :3].T @ gt_pose[:3, :3]) - 1) / 2
+        )
+        translation_errors.append(translation_error)
+        rotation_errors.append(rotation_error)
 
-    rgb_imgs, depth_imgs, K = [], [], []
-    for dir_name, _, files in os.walk(img_save_dir):
-        for file in files:
-            if "color" in file:
-                rgb_imgs.append(cv2.imread(os.path.join(dir_name, file)))
-            elif "depth" in file:
-                depth_imgs.append(
-                    cv2.imread(os.path.join(dir_name, file), cv2.IMREAD_ANYDEPTH)
-                )
-
-    for dir_name, _, files in os.walk(cam_info_save_dir):
-        for file in files:
-            with open(os.path.join(dir_name, file), "r") as f:
-                camera_info_dict = yaml.safe_load(f)
-                K.append(camera_info_dict["K"])
-
-    img_idx = 10
-    rgb_img, depth_img, cam_K = rgb_imgs[img_idx], depth_imgs[img_idx], K[0]
-    rgb_img = cv2.resize(rgb_img, (640, 480))
-    depth_img = cv2.resize(depth_img, (640, 480))
-    cam_K = np.array(cam_K) * 640 / 2048
-
-    roi = (640 * 1 / 4, 480 * 1 / 4, 640 * 3 / 4, 480 * 3 / 4)
-    rgb_img_roi = np.zeros_like(rgb_img)
-    rgb_img_roi[int(roi[1]) : int(roi[3]), int(roi[0]) : int(roi[2])] = rgb_img[
-        int(roi[1]) : int(roi[3]), int(roi[0]) : int(roi[2])
-    ]
-
-    ##############################
-    rgb_img_roi = cv2.GaussianBlur(rgb_img_roi, (5, 5), 3)
-    cv2.imshow("rgb_img_roi", rgb_img_roi)
-    blue_regions = extract_blue_regions(rgb_img_roi)
-    cv2.imshow("blue_regions", blue_regions)
-
-    small_bbox, large_bbox = get_bbox(blue_regions)
-
-    bbox_img = rgb_img.copy()
-    small_x, small_y, small_w, small_h = small_bbox
-    cv2.rectangle(
-        bbox_img,
-        (small_x, small_y),
-        (small_x + small_w, small_y + small_h),
-        (0, 255, 0),
-        2,
-    )
-    cv2.imshow("bbox", bbox_img)
-
-    bbox_img = np.zeros_like(rgb_img)
-    large_x, large_y, large_w, large_h = large_bbox
-    bbox_img[large_y : large_y + large_h, large_x : large_x + large_w] = rgb_img[
-        large_y : large_y + large_h, large_x : large_x + large_w
-    ]
-    gray_img = cv2.cvtColor(bbox_img, cv2.COLOR_BGR2GRAY)
-    gray_img = cv2.GaussianBlur(gray_img, (5, 5), 1)
-
-    canny_edges = cv2.Canny(gray_img, 100, 200)
-    edges = np.zeros_like(canny_edges)
-    edges[small_y : small_y + small_h, small_x : small_x + small_w] = canny_edges[
-        small_y : small_y + small_h, small_x : small_x + small_w
-    ]
-    cv2.imshow("edges", edges)
-
-    lines = cv2.HoughLinesP(
-        edges, 1, np.pi / 180, threshold=50, minLineLength=50, maxLineGap=50
-    )
-
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            cv2.line(bbox_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-    cv2.imshow("lines", bbox_img)
-
-    corner_on_lines = cv2.goodFeaturesToTrack(edges, 4, 0.01, 10)
-    for corner in corner_on_lines:
-        x, y = corner.ravel()
-        cv2.circle(bbox_img, (x, y), 3, 255, -1)
-    cv2.imshow("corner_on_lines", bbox_img)
-
-    # Define the object points of the box (in 3D space)
-    box_model_path = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)), "dataset", "mesh", "danpla_box.obj"
-    )
-    box_model = o3d.io.read_triangle_mesh(box_model_path)
-    box_points = np.asarray(box_model.vertices)
-    box_width = np.max(box_points[:, 0]) - np.min(box_points[:, 0])
-    box_height = np.max(box_points[:, 1]) - np.min(box_points[:, 1])
-    box_depth = np.max(box_points[:, 2]) - np.min(box_points[:, 2])
-
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    mean_translation_error = np.mean(translation_errors)
+    mean_rotation_error = np.mean(rotation_errors)
+    print(f"Mean translation error: {mean_translation_error * 1000} mm")
+    print(f"Mean rotation error: {np.rad2deg(mean_rotation_error)} degrees")
 
 
 def main(args=None):
-    test()
+    EVALUATE = False
+    if EVALUATE:
+        evaluate_detection()
+        return
+    else:
+        rclpy.init(args=args)
+        detector = CuboidDetector()
+        rclpy.spin(detector)
+        detector.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
