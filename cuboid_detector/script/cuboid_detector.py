@@ -1,6 +1,7 @@
 import os
 import yaml
 import json
+import argparse
 import cv2
 import numpy as np
 import open3d as o3d
@@ -20,6 +21,11 @@ from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import Point, Quaternion, PoseWithCovariance
 from vision_msgs.msg import Detection3D, Detection3DArray, ObjectHypothesisWithPose
 from realsense2_camera_msgs.msg import Extrinsics
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--evaluate", action="store_true", help="Evaluate the detection")
+parser.add_argument("--visualize", action="store_true", help="Visualize the detection")
 
 
 def get_package_path(package_name):
@@ -137,7 +143,7 @@ class CuboidDetector(Node):
                 self.depth_img = depth_img
                 self.color_img_timestamp = color_timestamp
                 self.depth_img_timestamp = depth_timestamp
-                self.perform_detection()
+                self.perform_detection(visualize=False, gt_pose=None)
             elif time_diff < 0:
                 self.color_image_buffer.popleft()
             else:
@@ -222,7 +228,7 @@ class CuboidDetector(Node):
             and self.color_img_timestamp == self.depth_img_timestamp
         ):
             self.get_logger().info("Performing detection...")
-            self.perform_detection()
+            self.perform_detection(visualize=False, gt_pose=None)
         elif self.color_img_timestamp != self.depth_img_timestamp:
             self.get_logger().info("Color and depth images are not synchronized.")
             self.get_logger().info(f"Color timestamp: {self.color_img_timestamp}")
@@ -238,7 +244,7 @@ class CuboidDetector(Node):
         elif self.depth_to_color_extrinsics is None:
             self.get_logger().info("Depth to color extrinsics is not received.")
 
-    def perform_detection(self):
+    def perform_detection(self, visualize=False, gt_pose=None):
         rgb_img = self.color_img
 
         blue_regions = self.extract_blue_regions(rgb_img)
@@ -313,26 +319,40 @@ class CuboidDetector(Node):
             object_points, image_points, self.color_intrinsic_matrix, dist_coeffs
         )
 
-        mesh_points_3d = self.mesh.sample_points_poisson_disk(number_of_points=10000)
-        mesh_points_2d, _ = cv2.projectPoints(
-            np.array(mesh_points_3d.points),
-            rotation_vector,
-            translation_vector,
-            self.color_intrinsic_matrix,
-            dist_coeffs,
-        )
-        mesh_points_2d = np.int32(mesh_points_2d).reshape(-1, 2)
-        shapes = np.zeros_like(rgb_img, np.uint8)
-        for i in range(len(mesh_points_2d)):
-            cv2.circle(shapes, tuple(mesh_points_2d[i]), 1, (0, 0, 255), -1)
-        out = rgb_img.copy()
-        alpha = 0.1
-        mask = shapes.astype(bool)
-        out[mask] = cv2.addWeighted(rgb_img, alpha, shapes, 1 - alpha, 0)[mask]
-        out = cv2.resize(out, (1280, 720))
-        cv2.imshow("result", out)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+        if visualize:
+            # mesh_points_3d = self.mesh.sample_points_poisson_disk(number_of_points=10000)
+            # mesh_points_2d, _ = cv2.projectPoints(
+            #     np.array(mesh_points_3d.points),
+            #     rotation_vector,
+            #     translation_vector,
+            #     self.color_intrinsic_matrix,
+            #     dist_coeffs,
+            # )
+            # mesh_points_2d = np.int32(mesh_points_2d).reshape(-1, 2)
+            # shapes = np.zeros_like(rgb_img, np.uint8)
+            # for i in range(len(mesh_points_2d)):
+            #     cv2.circle(shapes, tuple(mesh_points_2d[i]), 1, (0, 0, 255), -1)
+            out = rgb_img.copy()
+            # alpha = 0.1
+            # mask = shapes.astype(bool)
+            # out[mask] = cv2.addWeighted(rgb_img, alpha, shapes, 1 - alpha, 0)[mask]
+            out = self.draw_3d_bbox(out, box_points, rotation_vector, translation_vector, color=(0, 0, 255))
+            if gt_pose is not None:
+                gt_image_points, _ = cv2.projectPoints(
+                    object_points,
+                    gt_pose[:3, :3],
+                    gt_pose[:3, 3],
+                    self.color_intrinsic_matrix,
+                    dist_coeffs,
+                )
+                gt_image_points = np.int32(gt_image_points).reshape(-1, 2)
+                for point in gt_image_points:
+                    cv2.circle(out, tuple(point), 5, (0, 255, 0), -1)
+                out = self.draw_3d_bbox(out, box_points, gt_pose[:3, :3], gt_pose[:3, 3], color=(0, 255, 0))
+            out = cv2.resize(out, (1280, 720))
+            cv2.imshow("result", out)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
 
         detection_array_msg = Detection3DArray()
         detection_array_msg.header.stamp = self.get_clock().now().to_msg()
@@ -342,9 +362,9 @@ class CuboidDetector(Node):
         hypothesis_with_pose.hypothesis.class_id = "1"
         pose_with_covariance = PoseWithCovariance()
         pose_with_covariance.pose.position = Point(
-            x=float(translation_vector[0]),
-            y=float(translation_vector[1]),
-            z=float(translation_vector[2]),
+            x=float(translation_vector[0].item()),
+            y=float(translation_vector[1].item()),
+            z=float(translation_vector[2].item()),
         )
         quat = R.from_rotvec(rotation_vector.flatten()).as_quat()
         pose_with_covariance.pose.orientation = Quaternion(
@@ -402,8 +422,42 @@ class CuboidDetector(Node):
             large_h,
         ]
 
+    def draw_3d_bbox(self, img, box_points, rotation_vector, translation_vector, color=(0, 0, 255)):
+        object_points = box_points.astype(np.float32)
+        x_min, x_max = np.min(object_points[:, 0]), np.max(object_points[:, 0])
+        y_min, y_max = np.min(object_points[:, 1]), np.max(object_points[:, 1])
+        z_min, z_max = np.min(object_points[:, 2]), np.max(object_points[:, 2])
+        box_8_corners = np.array(
+            [
+                [x_max, y_min, z_max],
+                [x_min, y_min, z_max],
+                [x_min, y_max, z_max],
+                [x_max, y_max, z_max],
+                [x_max, y_min, z_min],
+                [x_min, y_min, z_min],
+                [x_min, y_max, z_min],
+                [x_max, y_max, z_min],
+            ]
+        )
+        image_points, _ = cv2.projectPoints(
+            box_8_corners, rotation_vector, translation_vector, self.color_intrinsic_matrix, np.zeros((4, 1))
+        )
+        image_points = np.int32(image_points).reshape(-1, 2)
+        for point in image_points:
+            cv2.circle(img, tuple(point), 5, color, -1)
 
-def evaluate_detection():
+        connections = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7)
+        ]
+        
+        for start, end in connections:
+            cv2.line(img, tuple(image_points[start]), tuple(image_points[end]), color, 2)
+
+        return img
+
+def evaluate_detection(visualize):
     rclpy.init(args=None)
     cuboid_detector = CuboidDetector()
 
@@ -413,7 +467,6 @@ def evaluate_detection():
     intrinsic_path = os.path.join(dataset_path, "camera_info", "camera_info.yaml")
 
     with open(intrinsic_path, "r") as f:
-        # Use the custom loader to handle special types
         camera_info = yaml.load(f, Loader=Loader)
 
     color_intrinsic_matrix = np.array(camera_info["K"]).reshape(3, 3)
@@ -421,7 +474,7 @@ def evaluate_detection():
     color_img_list = [img for img in os.listdir(img_path) if "color" in img]
     color_img_list.sort()
 
-    target_color_img_list = [img for i, img in enumerate(color_img_list) if i % 20 == 0]
+    target_color_img_list = [img for i, img in enumerate(color_img_list)]
 
     pred_pose_list = []
     gt_pose_list = []
@@ -430,11 +483,11 @@ def evaluate_detection():
         gt_pose = np.array(json.load(f))
     gt_pose_list.append(gt_pose)
 
-    for i, img_name in enumerate(tqdm(target_color_img_list[:-4])):
+    for i, img_name in enumerate(tqdm(target_color_img_list)):
         img = cv2.imread(os.path.join(img_path, img_name))
         cuboid_detector.color_img = img
         cuboid_detector.color_intrinsic_matrix = color_intrinsic_matrix
-        detection_array_msg = cuboid_detector.perform_detection()
+        detection_array_msg = cuboid_detector.perform_detection(visualize, gt_pose_list[0][i])
         if detection_array_msg is not None:
             pose_data = detection_array_msg.detections[0].results[0].pose.pose
             pose = np.eye(4)
@@ -460,28 +513,43 @@ def evaluate_detection():
 
     translation_errors = []
     rotation_errors = []
+    x_errors = []
+    y_errors = []
+    z_errors = []
 
     for pred_pose, gt_pose in zip(pred_pose_list, gt_pose_list):
+        x_error = gt_pose[0, 3] - pred_pose[0, 3]
+        y_error = gt_pose[1, 3] - pred_pose[1, 3]
+        z_error = gt_pose[2, 3] - pred_pose[2, 3]
         translation_error = np.linalg.norm(pred_pose[:3, 3] - gt_pose[:3, 3])
         rotation_error = np.arccos(
             (np.trace(pred_pose[:3, :3].T @ gt_pose[:3, :3]) - 1) / 2
         )
+        x_errors.append(x_error)
+        y_errors.append(y_error)
+        z_errors.append(z_error)
         translation_errors.append(translation_error)
         rotation_errors.append(rotation_error)
 
+    mean_x_error = np.mean(x_errors)
+    mean_y_error = np.mean(y_errors)
+    mean_z_error = np.mean(z_errors)
     mean_translation_error = np.mean(translation_errors)
     mean_rotation_error = np.mean(rotation_errors)
+    print(f"Mean x error: {mean_x_error * 1000} mm")
+    print(f"Mean y error: {mean_y_error * 1000} mm")
+    print(f"Mean z error: {mean_z_error * 1000} mm")
     print(f"Mean translation error: {mean_translation_error * 1000} mm")
     print(f"Mean rotation error: {np.rad2deg(mean_rotation_error)} degrees")
 
 
 def main(args=None):
-    EVALUATE = False
-    if EVALUATE:
-        evaluate_detection()
+    args = parser.parse_args()
+    if args.evaluate:
+        evaluate_detection(args.visualize)
         return
     else:
-        rclpy.init(args=args)
+        rclpy.init(args=None)
         detector = CuboidDetector()
         rclpy.spin(detector)
         detector.destroy_node()

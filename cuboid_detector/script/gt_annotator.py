@@ -115,7 +115,7 @@ def main():
     color_img_list = [img for img in os.listdir(img_path) if "color" in img]
     color_img_list.sort()
 
-    target_color_img_list = [img for i, img in enumerate(color_img_list) if i % 20 == 0]
+    target_color_img_list = [img for i, img in enumerate(color_img_list)]
 
     for img_name in target_color_img_list:
         img = cv2.imread(os.path.join(img_path, img_name))
