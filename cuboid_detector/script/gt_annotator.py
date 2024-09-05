@@ -6,26 +6,20 @@ import yaml
 import open3d as o3d
 from yaml import Loader
 
-# Define the points list globally so it persists across function calls
 points = []
 
-# Custom constructor for `array.array` objects in the YAML file
 def array_constructor(loader, node):
     seq = loader.construct_sequence(node)
     try:
-        # Attempt to convert the entire sequence into a NumPy array directly
         return np.array(seq)
     except ValueError:
-        # If there's a shape mismatch, convert each element individually
         return np.array([np.array(i) for i in seq], dtype=object)
 
-# Add the custom constructor to the YAML Loader
 yaml.add_constructor('tag:yaml.org,2002:python/object/apply:array.array', array_constructor, Loader=Loader)
 
 def mouse_callback(event, x, y, flags, param):
     global points
 
-    # Only add points when the left mouse button is clicked
     if event == cv2.EVENT_LBUTTONDOWN:
         points.append((x, y))
         cv2.circle(img, (x, y), 5, (0, 0, 255), -1)
@@ -33,7 +27,7 @@ def mouse_callback(event, x, y, flags, param):
 
         if len(points) == 4:
             save_ground_truth(points)
-            points.clear()  # Clear the points list after saving
+            points.clear()
 
 def save_ground_truth(points):
     corners = np.array(points).reshape(4, 2)
@@ -41,7 +35,6 @@ def save_ground_truth(points):
     intrinsic_path = os.path.join(dataset_path, "camera_info", "camera_info.yaml")
     
     with open(intrinsic_path, "r") as f:
-        # Use the custom loader to handle special types
         camera_info = yaml.load(f, Loader=Loader)
 
     color_intrinsic_matrix = np.array(camera_info["K"]).reshape(3, 3)
@@ -82,8 +75,6 @@ def save_ground_truth(points):
     pose = np.eye(4)
     pose[:3, :3] = cv2.Rodrigues(rotation_vector)[0]
     pose[:3, 3] = translation_vector.flatten()
-    # with open(os.path.join(dataset_path, "data", "pose.json"), "w") as f:
-    #     json.dump(pose.tolist(), f)
 
     def append_to_pose_file(pose):
         dataset_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dataset")
