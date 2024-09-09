@@ -37,15 +37,18 @@ def get_package_path(package_name):
         return None
 
 
-def get_dirpath_iteratively(dirpath, num_iter):
-    for _ in range(num_iter):
-        dirpath = os.path.dirname(dirpath)
-    return dirpath
+# def get_dirpath_iteratively(dirpath, num_iter):
+#     for _ in range(num_iter):
+#         dirpath = os.path.dirname(dirpath)
+#     return dirpath
 
 
 class CuboidDetector(Node):
     def __init__(self):
         super().__init__("cuboid_detector")
+        self.logger = self.get_logger()
+        self.logger.info("Cuboid detector node started.")
+
         self.bridge = CvBridge()
 
         self.color_img_sub = self.create_subscription(
@@ -76,15 +79,18 @@ class CuboidDetector(Node):
         self.cam_info_save_dir = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "dataset", "camera_info"
         )
-        self.pkg_name = "cuboid_detector"
-        self.pkg_path = get_dirpath_iteratively(get_package_path(self.pkg_name), 4)
-        self.mesh_path = os.path.join(
-            self.pkg_path,
-            "src/Cuboid_detector",
-            self.pkg_name,
-            "dataset/mesh/danpla_box.obj",
-        )
-        self.mesh = self.load_mesh(self.mesh_path)
+        _pkg_name = "cuboid_detector"
+        _pkg_path = get_package_path(_pkg_name)
+        # pkg_path = $WORKSPACE/install/cuboid_detector/share/cuboid_detector
+        _mesh_path = os.path.join(_pkg_path, "sample_data", "danpla_box.obj")
+        # self.pkg_path = get_dirpath_iteratively(get_package_path(_pkg_name), 4)
+        # self.mesh_path = os.path.join(
+        #     self.pkg_path,
+        #     "src/Cuboid_detector",
+        #     _pkg_name,
+        #     "dataset/mesh/danpla_box.obj",
+        # )
+        self.mesh = self.load_mesh(_mesh_path)
 
         self.color_image_buffer = deque()
         self.depth_image_buffer = deque()
@@ -94,6 +100,7 @@ class CuboidDetector(Node):
         self.depth_to_color_extrinsics = None
 
         self.detection_in_progress = False
+        self.logger.info("Cuboid detector node initialized.")
 
     def color_img_callback(self, msg):
         if self.detection_in_progress:
@@ -336,7 +343,7 @@ class CuboidDetector(Node):
             # alpha = 0.1
             # mask = shapes.astype(bool)
             # out[mask] = cv2.addWeighted(rgb_img, alpha, shapes, 1 - alpha, 0)[mask]
-            out = self.draw_3d_bbox(out, box_points, rotation_vector, translation_vector, color=(0, 0, 255))
+            out = self.draw_3d_bbox(out, box_points, rotation_vector, translation_vector, color=(0, 0, 255), thickness=4)
             if gt_pose is not None:
                 gt_image_points, _ = cv2.projectPoints(
                     object_points,
@@ -348,9 +355,10 @@ class CuboidDetector(Node):
                 gt_image_points = np.int32(gt_image_points).reshape(-1, 2)
                 for point in gt_image_points:
                     cv2.circle(out, tuple(point), 5, (0, 255, 0), -1)
-                out = self.draw_3d_bbox(out, box_points, gt_pose[:3, :3], gt_pose[:3, 3], color=(0, 255, 0))
+                out = self.draw_3d_bbox(out, box_points, gt_pose[:3, :3], gt_pose[:3, 3], color=(0, 255, 0), thickness=2)
             out = cv2.resize(out, (1280, 720))
             cv2.imshow("result", out)
+            print("Press any key to continue...")
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
@@ -422,7 +430,7 @@ class CuboidDetector(Node):
             large_h,
         ]
 
-    def draw_3d_bbox(self, img, box_points, rotation_vector, translation_vector, color=(0, 0, 255)):
+    def draw_3d_bbox(self, img, box_points, rotation_vector, translation_vector, color=(0, 0, 255), thickness=2):
         object_points = box_points.astype(np.float32)
         x_min, x_max = np.min(object_points[:, 0]), np.max(object_points[:, 0])
         y_min, y_max = np.min(object_points[:, 1]), np.max(object_points[:, 1])
@@ -451,9 +459,9 @@ class CuboidDetector(Node):
             (4, 5), (5, 6), (6, 7), (7, 4),
             (0, 4), (1, 5), (2, 6), (3, 7)
         ]
-        
+
         for start, end in connections:
-            cv2.line(img, tuple(image_points[start]), tuple(image_points[end]), color, 2)
+            cv2.line(img, tuple(image_points[start]), tuple(image_points[end]), color, thickness)
 
         return img
 
@@ -546,9 +554,11 @@ def evaluate_detection(visualize):
 def main(args=None):
     args = parser.parse_args()
     if args.evaluate:
+        print(1)
         evaluate_detection(args.visualize)
         return
     else:
+        print(2)
         rclpy.init(args=None)
         detector = CuboidDetector()
         rclpy.spin(detector)
