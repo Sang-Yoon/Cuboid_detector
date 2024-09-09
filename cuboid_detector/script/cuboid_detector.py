@@ -554,11 +554,9 @@ def evaluate_detection(visualize):
 def main(args=None):
     args = parser.parse_args()
     if args.evaluate:
-        print(1)
         evaluate_detection(args.visualize)
         return
     else:
-        print(2)
         rclpy.init(args=None)
         detector = CuboidDetector()
         rclpy.spin(detector)
