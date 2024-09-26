@@ -1,5 +1,6 @@
-numpy
+numpy~=1.25.0
 PyYAML
 opencv-python
 scipy
 tqdm
+open3d
